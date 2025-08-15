@@ -1,19 +1,26 @@
 import torch
 import torch.nn.functional as F
 from math import exp
-import numpy as np
 
+def image_dim(img):
+    return img.ndimension() - 2
 
 def gaussian(window_size, sigma):
     gauss = torch.Tensor([exp(-(x - window_size//2)**2/float(2*sigma**2)) for x in range(window_size)])
     return gauss/gauss.sum()
 
 
-def create_window(window_size, channel=1):
+def create_window(window_size, n_dim, channel=1):
     _1D_window = gaussian(window_size, 1.5).unsqueeze(1)
-    _2D_window = _1D_window.mm(_1D_window.t()).float().unsqueeze(0).unsqueeze(0)
-    window = _2D_window.expand(channel, 1, window_size, window_size).contiguous()
-    return window
+    _2D_window = _1D_window.mm(_1D_window.t()).float()
+
+    _3D_window = torch.stack([ _2D_window * x for x in _1D_window],dim=2).float().unsqueeze(0).unsqueeze(0)
+    _2D_window = _2D_window.unsqueeze(0).unsqueeze(0)
+
+    if n_dim == 3:
+        return _3D_window.expand(channel, 1, window_size, window_size,window_size).contiguous()
+    else:
+        return _2D_window.expand(channel, 1, window_size, window_size).contiguous()
 
 
 def ssim(img1, img2, window_size=11, window=None, size_average=True, full=False, val_range=None):
@@ -33,21 +40,30 @@ def ssim(img1, img2, window_size=11, window=None, size_average=True, full=False,
         L = val_range
 
     padd = 0
-    (_, channel, height, width) = img1.size()
+
+    n_dim = image_dim(img1)
+
+    if n_dim == 2:
+        (_, channel, height, width) = img1.size()
+        convFunction = F.conv2d
+    if n_dim == 3:
+        convFunction = F.conv3d
+        (_, channel, height, width, depth) = img1.size()
+
     if window is None:
         real_size = min(window_size, height, width)
-        window = create_window(real_size, channel=channel).to(img1.device)
+        window = create_window(real_size, n_dim, channel=channel).to(img1.device)
 
-    mu1 = F.conv2d(img1, window, padding=padd, groups=channel)
-    mu2 = F.conv2d(img2, window, padding=padd, groups=channel)
+    mu1 = convFunction(img1, window, padding=padd, groups=channel)
+    mu2 = convFunction(img2, window, padding=padd, groups=channel)
 
     mu1_sq = mu1.pow(2)
     mu2_sq = mu2.pow(2)
     mu1_mu2 = mu1 * mu2
 
-    sigma1_sq = F.conv2d(img1 * img1, window, padding=padd, groups=channel) - mu1_sq
-    sigma2_sq = F.conv2d(img2 * img2, window, padding=padd, groups=channel) - mu2_sq
-    sigma12 = F.conv2d(img1 * img2, window, padding=padd, groups=channel) - mu1_mu2
+    sigma1_sq = convFunction(img1 * img1, window, padding=padd, groups=channel) - mu1_sq
+    sigma2_sq = convFunction(img2 * img2, window, padding=padd, groups=channel) - mu2_sq
+    sigma12 = convFunction(img1 * img2, window, padding=padd, groups=channel) - mu1_mu2
 
     C1 = (0.01 * L) ** 2
     C2 = (0.03 * L) ** 2
@@ -76,6 +92,15 @@ def msssim(img1, img2, window_size=11, size_average=True, val_range=None, normal
     levels = weights.size()[0]
     ssims = []
     mcs = []
+
+    n_dim = image_dim(img1)
+
+    pool_size = [2] * n_dim
+    if n_dim == 2:
+        pool_function = F.avg_pool2d
+    if n_dim == 3:
+        pool_function = F.avg_pool3d
+
     for _ in range(levels):
         sim, cs = ssim(img1, img2, window_size=window_size, size_average=size_average, full=True, val_range=val_range)
 
@@ -87,8 +112,8 @@ def msssim(img1, img2, window_size=11, size_average=True, val_range=None, normal
             ssims.append(sim)
             mcs.append(cs)
 
-        img1 = F.avg_pool2d(img1, (2, 2))
-        img2 = F.avg_pool2d(img2, (2, 2))
+        img1 = pool_function(img1, pool_size)
+        img2 = pool_function(img2, pool_size)
 
     ssims = torch.stack(ssims)
     mcs = torch.stack(mcs)
@@ -117,15 +142,18 @@ class SSIM(torch.nn.Module):
 
         # Assume 1 channel for SSIM
         self.channel = 1
-        self.window = create_window(window_size)
+        self.window = None
 
     def forward(self, img1, img2):
         (_, channel, _, _) = img1.size()
+        #Initialize window on first call
+        if self.window is None:
+            create_window(self.window_size, image_dim(img1)).to(img1.device).type(img1.dtype)
 
         if channel == self.channel and self.window.dtype == img1.dtype:
             window = self.window
         else:
-            window = create_window(self.window_size, channel).to(img1.device).type(img1.dtype)
+            window = create_window(self.window_size, image_dim(img1),channel).to(img1.device).type(img1.dtype)
             self.window = window
             self.channel = channel
 
